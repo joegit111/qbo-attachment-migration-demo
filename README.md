@@ -60,7 +60,13 @@ In ETL terms:
 From a clean clone, on a machine with Python 3.10+:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python -m src.download_mapping_demo && python -m src.build_attachment_inventory && python -m src.mapping_verifier && python -m src.qbo_attach_demo
+python -m venv .venv && \
+source .venv/bin/activate && \
+pip install -r requirements.txt && \
+python -m src.download_mapping_demo && \
+python -m src.build_attachment_inventory && \
+python -m src.mapping_verifier && \
+python -m src.qbo_attach_demo
 ```
 
 After that, the main outputs live under logs/:
@@ -135,7 +141,7 @@ What happens if the job dies halfway.
 If the process dies in the middle of a run, only the attachments that were successfully written to qbo_attach_runlog.csv with a success outcome are considered done. On restart, the uploader reloads that log and skips those pairs. Any attachments that were in flight when the process died simply show no successful row, so they are retried.
 
 How to replay safely.  
-Safe replay is “run the uploader again.” Because the decision to skip or upload is driven entirely by the run log and the idempotent key, a replay does not double-attach files that already succeeded. Partial failures are handled by leaving failed rows in the log with an error outcome and re-attempting them on the next run.
+Safe replay is to run the uploader again. Because the decision to skip or upload is driven entirely by the run log and the idempotent key, a replay does not double-attach files that already succeeded. Partial failures are handled by leaving failed rows in the log with an error outcome and re-attempting them on the next run.
 
 How to detect partial uploads.  
 Partial uploads are visible in three places:
@@ -176,12 +182,12 @@ For higher volumes:
 - The uploader could batch work by entity type or by file size.
 - Concurrency could be added at the attachment level (for example, a worker pool over the inventory) as long as all workers share a consistent run-log view or write to a central log sink (database table, Kafka topic, and so on).
 
-The point is not raw speed in this demo; the point is that the idempotent structure and logging make it safe to turn up throughput later.
+The emphasis in this demo is on safety and clarity of behavior; the same structure can support higher throughput once distributed execution and external storage are introduced.
 
 ## Path to production
 
-Blob storage.  
-DATA_DIR and FILES_DIR would point to S3 or GCS buckets instead of a local filesystem. Inventory building would list objects in a prefix rather than walking directories.
+Blob storage (S3/GCS).  
+In a cloud deployment, DATA_DIR and FILES_DIR would point to S3 or GCS buckets instead of a local filesystem. Inventory building would list objects in a prefix rather than walking directories. The rest of the pipeline logic stays the same.
 
 Orchestrator.  
 The scripts would become tasks in an Airflow, Prefect, or Dagster flow:
@@ -200,11 +206,11 @@ The CSV logs would land in a warehouse (Snowflake, BigQuery, Redshift) as:
 - attachment_errors table.
 
 Monitoring.  
-Metrics around counts and error rates would be exported to something like Prometheus, DataDog, or similar, with alerting rules wired to on-call.
+Metrics around counts and error rates would be exported to something like Prometheus, DataDog, or a similar monitoring stack, with alerting rules wired to on-call.
 
 ## Real-world origin and what is missing here
 
-Origin.  
+Real-world origin.  
 This design comes from a QuickBooks Desktop to QuickBooks Online migration where attachments were handled as a dedicated pipeline. That system worked against hundreds of thousands of transactions and roughly one hundred seventy thousand attachments, with a similar legacy Attach tree, mapping export, ID normalization rule, idempotent uploader, and CSV logs feeding auditors and downstream teams.
 
 Deliberately not included in this repo:
@@ -215,15 +221,15 @@ Deliberately not included in this repo:
 - No infrastructure-as-code, containerization, or deployment scripts.
 - No orchestrator configuration (Airflow DAGs, Prefect flows, and so on).
 
-Those are left out on purpose so the focus stays on the data-engineering core: mapping, ID normalization, idempotent updates, and logging. In a real org, those concerns would be layered on top of this skeleton.
+These pieces are omitted on purpose so the focus stays on the data-engineering core: mapping, ID normalization, idempotent updates, and logging. In a production environment, those concerns would be layered on top of this skeleton.
 
 ## Relevance for data engineering roles
 
-The project is meant to read like the minimal design and implementation for a real migration problem:
+The project is structured as a minimal design and implementation for a realistic migration workflow:
 
-- File- and row-level idempotency instead of “just rerun it and hope.”
+- Explicit file- and row-level idempotency, backed by a durable run log.
 - Clear separation between discovery, verification, and writing to the external system.
 - Logs structured so that auditors and downstream analysts can work with them without reverse-engineering the code.
-- A fake API that forces the uploader to handle latency, missing files, and failures, instead of assuming happy paths.
+- A fake API that forces the uploader to handle latency, missing files, and failures rather than assuming ideal conditions.
 
-It is not a toy coding challenge; it is a self-contained example of how a migration pipeline might be shaped before being dropped into a larger platform.
+It is intended as a self-contained example of how an attachment migration pipeline can be structured before being integrated into a larger data platform.
