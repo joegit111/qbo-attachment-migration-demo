@@ -1,0 +1,35 @@
+# Python cache and build junk
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# macOS noise
+.DS_Store
+*.DS_Store
+
+# Editor / IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Pytest cache
+.pytest_cache/
+
+# Logs and runtime outputs
+logs/
+*.log
+
+# Jupyter / notebook stuff (if added)
+.ipynb_checkpoints/
