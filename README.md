@@ -3,31 +3,33 @@
 
 ## TL;DR
 
-Small, self-contained data engineering project that demonstrates how to design an idempotent batch pipeline for migrating legacy file attachments into QuickBooks Online style entities.
+Data engineering project that builds an idempotent batch pipeline for migrating legacy file attachments into QuickBooks Online–style entities.
 
-The project focuses on:
+The pipeline:
 
-- Identifier normalization and mapping verification before any "API" work.
-- Idempotent upload logic built around a persistent run log.
-- Structured CSV logs for observability, data quality checks, and auditability.
-- A fake remote API with controlled failure modes to exercise error handling and retries.
+- Walks a legacy attachment tree and flattens it into an inventory.
+- Normalizes legacy transaction identifiers and joins them against a mapping export.
+- Verifies mapping coverage before any "API" work.
+- Runs an idempotent uploader against a fake QBO attachment API.
+- Emits structured CSV logs for observability, audit, and safe reruns.
 
-Originally inspired by a production migration that handled hundreds of thousands of legacy transactions and more than one hundred thousand attachments, this repository recreates the core ideas on a synthetic, laptop-sized dataset.
+The design is based on a production migration that handled hundreds of thousands of legacy transactions and roughly one hundred seventy thousand attachments. This repo replays the core ideas on synthetic, laptop-sized data.
 
-## Project highlights (for reviewers)
+## Project highlights
 
-- Designed a configuration-driven, idempotent batch pipeline to migrate legacy attachments into QuickBooks Online style entities.
-- Implemented explicit identifier normalization and mapping verification to catch data issues before simulated API calls.
-- Simulated a remote attachment API with tunable failure rates in order to test error handling, logging, and reruns.
-- Emitted structured CSV logs that make partial failures safe to rerun and easy to reason about.
+- Batch pipeline that treats a messy legacy filesystem as source and a QBO-like API as sink.
+- Explicit identifier normalization and mapping verification to catch data issues before upload.
+- Idempotent uploader keyed on (entity_id, file_name) with a persistent run log.
+- Fake remote API with controlled failures to exercise error handling and retries.
+- Logs designed to be loaded into a warehouse for analysis and audit.
 
 ## Tech stack
 
 - Language: Python 3.10+
 - Libraries: standard library only (pathlib, csv, dataclasses, typing, random, time).
-- Storage: local filesystem for both source files and logs (in a real deployment these directories would map cleanly to S3 or GCS buckets).
-- Configuration: environment-variable driven, centralized in `src/config.py`.
-- Testing: small `tests/` package intended to cover normalization and idempotency logic.
+- Storage: local filesystem for files and logs (would map cleanly to S3 or GCS buckets).
+- Configuration: environment variables read in src/config.py (DATA_DIR, FILES_DIR, LOG_DIR).
+- Testing: pytest tests intended to cover normalization, joins, and idempotency behavior.
 
 ## Architecture snapshot
 
@@ -47,115 +49,181 @@ qbo_attach_demo
 fake_qbo_api   structured logs (run, errors, dups, verification)
 ```
 
-In ETL terms this can be read as:
+In ETL terms:
 
 - Extract: scan a legacy attachment tree into a flat inventory.
-- Transform: normalize identifiers, join against a mapping export, and filter out invalid rows.
-- Load: attach files to mapped entities via a simulated remote API, with idempotent behavior and detailed logging.
+- Transform: normalize IDs, join to mapping export, label invalid or skipped rows.
+- Load: attach files to mapped entities via a QBO-like API, with idempotent semantics.
+
+## One-shot quick start
+
+From a clean clone, on a machine with Python 3.10+:
+
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python -m src.download_mapping_demo && python -m src.build_attachment_inventory && python -m src.mapping_verifier && python -m src.qbo_attach_demo
+```
+
+After that, the main outputs live under logs/:
+
+- qbo_attach_runlog.csv – all attempts (success, failure, skipped).
+- qbo_attach_errors.csv – filtered failures.
+- qbo_attach_dups.csv – idempotent skips.
+- mapping_verification_log.csv – mapping coverage and statuses.
+
+### Tests
+
+If pytest is installed, core behaviors can be exercised with:
+
+```bash
+pytest
+```
+
+Tests are aimed at normalize_legacy_id, mapping joins, and idempotency logic driven by prior run logs.
 
 ## Repository layout
 
-The repository is structured to mirror the stages a data engineer would implement in a real migration.
+src/config.py centralizes configuration. It resolves DATA_DIR, FILES_DIR, and LOG_DIR from environment variables (with defaults relative to the repo root), ensures the log directory exists, and defines shared paths for the inventory, mapping, and log CSVs. It also exposes normalize_legacy_id, the canonical normalization rule for legacy transaction identifiers.
 
-`src/config.py` centralizes configuration. It resolves `DATA_DIR`, `FILES_DIR`, and `LOG_DIR` from environment variables (with defaults relative to the repository root), ensures that the log directory exists, and defines shared paths such as `attachments_inventory.csv`, `mapping_export.csv`, and the various log files. It also exposes the `normalize_legacy_id` function, which implements the canonical identifier normalization rule for the pipeline.
+src/auth_qbo_demo.py represents the authentication layer. A production version would encapsulate OAuth 2.0 and return an authorized HTTP session plus realm id. The demo version returns a small FakeQboSession object and a dummy realm id so the module boundary matches a real QBO integration without pulling in any external dependencies.
 
-`src/auth_qbo_demo.py` represents the authentication layer. In a production system this module would encapsulate the OAuth 2.0 flow and return an authorized HTTP session and realm identifier. In this demonstration it returns a small `FakeQboSession` object and a dummy realm id so that the structure of the code matches a real QuickBooks integration without any external dependencies.
+src/fake_qbo_api.py simulates the QuickBooks Online attachment API. The attach_file function accepts an entity type, entity id, and file path, measures elapsed time, checks for missing files, and injects failures at a configurable rate. It returns a response object with a synthetic HTTP status code, a fake Intuit-style id on success, an error message on failure, and a duration in milliseconds. The uploader treats it like a real HTTP client.
 
-`src/fake_qbo_api.py` simulates the QuickBooks Online attachment API. Its `attach_file` function accepts an entity type, entity identifier, and file path, measures a simple elapsed time, checks for missing files, and randomly injects failures at a configurable rate. It returns a small response object containing a synthetic HTTP status code, an Intuit-style id on success, an error message on failure, and a duration in milliseconds. This allows the uploader to exercise realistic error handling, logging, and retry behavior without leaving the local machine.
+src/build_attachment_inventory.py walks a legacy-style folder tree under FILES_DIR, parses folder names to recover legacy transaction identifiers, normalizes them, and writes attachments_inventory.csv with one row per file. This models the common “flatten the Attach tree” step that turns a path such as Attach/Client/Txn/<RawId>/file.ext into structured metadata.
 
-`src/build_attachment_inventory.py` walks a synthetic legacy folder tree under `FILES_DIR`, extracts a normalized legacy transaction identifier from folder names, and writes a flat `attachments_inventory.csv` file with one row per discovered attachment. This models the “metadata discovery” step that converts an ad hoc directory structure such as `Attach/<Client>/Txn/<TxnId>/file.ext` into something that can be joined and validated.
+src/download_mapping_demo.py stands in for the QbdtEntityIdMapping export. In production this would be an upstream table or API. Here it writes mapping_export.csv under DATA_DIR using synthetic data that is consistent with the inventory and normalization logic.
 
-`src/download_mapping_demo.py` stands in for the step that produces a `QbdtEntityIdMapping` export. In a full system this export would come from an upstream migration or QuickBooks API. Here it simply writes `mapping_export.csv` under `DATA_DIR` using synthetic data that matches the normalization rules and identifiers in the attachment inventory.
+src/mapping_verifier.py loads mapping_export.csv and attachments_inventory.csv, joins on legacy_txnid_norm and entity type, and writes:
 
-`src/mapping_verifier.py` loads `mapping_export.csv` and `attachments_inventory.csv`, joins attachments to mappings using `legacy_txnid_norm` and entity type, and writes two verification files under `LOG_DIR`: `mapping_verification_log.csv` for in-scope rows with explicit status flags, and `mapping_verification_skips.csv` for rows that were intentionally excluded by configuration. This stage acts as a data quality and completeness check before any upload attempts.
+- mapping_verification_log.csv – attachment rows and whether they have valid mappings.
+- mapping_verification_skips.csv – rows intentionally excluded by configuration.
 
-`src/qbo_attach_demo.py` is the main batch uploader. It reads the verified attachments, builds an in-memory idempotency index from the prior `qbo_attach_runlog.csv`, calls `fake_qbo_api.attach_file` for new work, and writes detailed logs of every attempt into `qbo_attach_runlog.csv`, `qbo_attach_errors.csv`, and `qbo_attach_dups.csv`. It treats the run log as the source of truth when deciding whether a particular file has already been attached to a particular entity.
+This stage is a data quality and completeness gate before any uploads.
 
-A small `tests/` package is intended to cover the core behaviors that matter in production: identifier normalization, mapping joins, and idempotency behavior given different combinations of prior run log entries.
+src/qbo_attach_demo.py is the batch uploader. It:
+
+- Reads the verified attachments.
+- Loads qbo_attach_runlog.csv (if present) and builds an in-memory index of prior successes keyed by (qbo_entity_id, file_name).
+- Calls fake_qbo_api.attach_file for work that has not succeeded before.
+- Writes structured rows into qbo_attach_runlog.csv, qbo_attach_errors.csv, and qbo_attach_dups.csv.
+
+A tests/ package (not shown here) is meant to exercise the behaviors that matter in production: normalization, mapping joins, and idempotent decisions given different prior logs.
 
 ## Normalized identifier and idempotent design
 
-The original system used transaction identifiers with a fixed prefix that did not appear in the mapping export. Rather than relying on ad hoc string slicing, this project treats normalization as a first-class concern via the `normalize_legacy_id` helper in `config.py`.
+The original system used transaction identifiers with a fixed prefix in the legacy filesystem that did not appear in the mapping export. Instead of sprinkling s[2:] and .upper() across the codebase, normalization is pulled into a single helper: normalize_legacy_id in config.py.
 
-All components that deal with identifiers work against the normalized form:
+Every component works with the normalized form:
 
-- `build_attachment_inventory.py` parses raw folder names and immediately normalizes them into `legacy_txnid_norm`.
-- `download_mapping_demo.py` emits mapping rows keyed by `legacy_txnid_norm`.
-- `mapping_verifier.py` performs joins exclusively on the normalized key.
-- `qbo_attach_demo.py` uses the same key when building its joins and logs.
+- build_attachment_inventory.py parses raw folder names and writes legacy_txnid_norm.
+- download_mapping_demo.py writes mapping rows keyed on legacy_txnid_norm.
+- mapping_verifier.py joins inventory to mapping on the normalized id.
+- qbo_attach_demo.py uses the same normalized key in its joins and logs.
 
-This eliminates an entire class of subtle bugs around mismatched prefixes and casing.
+That removes an entire class of subtle bugs around mismatched prefixes, casing, and formatting.
 
-Idempotency is implemented at the level of individual attachment-to-entity pairs. The uploader treats a pair `(qbo_entity_id, file_name)` as the natural idempotent key. At startup it reads `qbo_attach_runlog.csv` (if present), filters for prior successes, and builds an index in memory. When the script encounters the same pair again, it records a new row with an outcome such as `skipped_already_uploaded` without calling the fake API a second time.
+Idempotency is implemented at the level of attachment–entity pairs. The uploader treats (qbo_entity_id, file_name) as the idempotent key. At startup it:
 
-This pattern makes the pipeline safe to rerun in the presence of network glitches, process restarts, or other partial failures, and it aligns with how idempotent batch jobs are designed in larger data platforms.
+- Reads qbo_attach_runlog.csv (if it exists).
+- Filters for prior successes.
+- Builds an in-memory index keyed on that pair.
 
-## Running the demo
+When the same pair appears again, the job writes a new row marked as skipped rather than calling the API again. This makes reruns safe after failures or restarts without needing distributed locks or external dedup tables.
 
-Running the demonstration requires Python 3.10 or later.
+## Failure modes and operational behavior
 
-1. Create and activate a virtual environment, then install the dependencies:
+What happens if the job dies halfway.  
+If the process dies in the middle of a run, only the attachments that were successfully written to qbo_attach_runlog.csv with a success outcome are considered done. On restart, the uploader reloads that log and skips those pairs. Any attachments that were in flight when the process died simply show no successful row, so they are retried.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+How to replay safely.  
+Safe replay is “run the uploader again.” Because the decision to skip or upload is driven entirely by the run log and the idempotent key, a replay does not double-attach files that already succeeded. Partial failures are handled by leaving failed rows in the log with an error outcome and re-attempting them on the next run.
 
-2. Set the environment variables used by `config.py`, or rely on the defaults. The typical configuration is:
+How to detect partial uploads.  
+Partial uploads are visible in three places:
 
-- `DATA_DIR` pointing to the `data` folder in the repository root.
-- `LOG_DIR` pointing to a writable `logs` folder.
-- `FILES_DIR` pointing to a small synthetic legacy attachment tree.
+- The count of distinct (qbo_entity_id, file_name) pairs with success versus the count of attachment rows in the verifier log.
+- The size of qbo_attach_errors.csv (persistent failures).
+- The presence of attachment rows with no corresponding success row in the run log.
 
-3. Generate the synthetic mapping and attachment inventory:
+In a real system, these would be materialized as tables in a warehouse and monitored with simple queries.
 
-```bash
-python -m src.download_mapping_demo
-python -m src.build_attachment_inventory
-```
+How to detect data drift.  
+Data drift here mostly means “mapping export diverged from the filesystem reality.” The mapping_verifier.py stage is the drift detector:
 
-4. Run the mapping verifier:
+- New attachments with no mapping land in mapping_verification_log.csv with a missing-mapping status.
+- Counts per entity type between inventory and mapping can be compared over time.
 
-```bash
-python -m src.mapping_verifier
-```
+Where alerts and metrics would live in production.  
+If wired into a monitoring stack, obvious metrics and alerts would be:
 
-5. Run the uploader:
+- Gauge: number of successful attachments per run.
+- Gauge: number of failed attachments per run.
+- Gauge: number of missing mappings per run.
+- Counter: total runtime and p95 duration per attachment call.
 
-```bash
-python -m src.qbo_attach_demo
-```
+Thresholds on “failed > 0” or “missing mappings > 0” would alert before bad data sneaks into accounting.
 
-After these steps, the most interesting files to inspect for portfolio purposes are:
+## Data volume and performance thinking
 
-- `logs/qbo_attach_runlog.csv` to see how successful uploads, skips, and failures are represented.
-- `logs/qbo_attach_errors.csv` to see how failures are captured with status codes and messages.
-- `logs/qbo_attach_dups.csv` to see how idempotent behavior is summarized.
-- `logs/mapping_verification_log.csv` to see how mapping coverage and data quality checks are expressed.
+This repository runs on synthetic data sized to complete in seconds on a laptop. The design generalizes because:
 
-These logs can be opened in any spreadsheet tool or loaded into a database for further analysis.
+- Work is row-oriented: attachments are processed independently.
+- Idempotent keys are compact (entity_id, file_name) pairs.
+- The run log is append-only and can be partitioned (by date, by batch id, and so on).
 
-## Real-world origin and scale
+For higher volumes:
 
-The structure of this repository is based on a production QuickBooks Desktop to QuickBooks Online migration in which attachment handling was built as a dedicated pipeline. That project worked against hundreds of thousands of legacy transactions and on the order of one hundred seventy thousand attachments extracted from a legacy Attach tree. The same concerns appear there as in this demo:
+- Inventory building would stream results rather than holding everything in memory.
+- The uploader could batch work by entity type or by file size.
+- Concurrency could be added at the attachment level (for example, a worker pool over the inventory) as long as all workers share a consistent run-log view or write to a central log sink (database table, Kafka topic, and so on).
 
-- Mapping coverage and identifier normalization.
-- Safe, repeatable batch runs across large attachment inventories.
-- Logging that can support auditors and downstream teams, not just developers.
+The point is not raw speed in this demo; the point is that the idempotent structure and logging make it safe to turn up throughput later.
 
-The synthetic dataset in this repository is deliberately small so that it can be run end-to-end on a laptop in seconds, but the code and design choices are intended to scale by swapping the local filesystem for S3 or GCS and wiring the scripts into an orchestrator such as Airflow, Prefect, or Dagster.
+## Path to production
+
+Blob storage.  
+DATA_DIR and FILES_DIR would point to S3 or GCS buckets instead of a local filesystem. Inventory building would list objects in a prefix rather than walking directories.
+
+Orchestrator.  
+The scripts would become tasks in an Airflow, Prefect, or Dagster flow:
+
+- Task A: build attachment inventory.
+- Task B: fetch mapping export.
+- Task C: run mapping verifier and emit verification tables.
+- Task D: run uploader in batches.
+
+Warehouse.  
+The CSV logs would land in a warehouse (Snowflake, BigQuery, Redshift) as:
+
+- attachment_inventory table.
+- attachment_mapping_verification table.
+- attachment_run_log table.
+- attachment_errors table.
+
+Monitoring.  
+Metrics around counts and error rates would be exported to something like Prometheus, DataDog, or similar, with alerting rules wired to on-call.
+
+## Real-world origin and what is missing here
+
+Origin.  
+This design comes from a QuickBooks Desktop to QuickBooks Online migration where attachments were handled as a dedicated pipeline. That system worked against hundreds of thousands of transactions and roughly one hundred seventy thousand attachments, with a similar legacy Attach tree, mapping export, ID normalization rule, idempotent uploader, and CSV logs feeding auditors and downstream teams.
+
+Deliberately not included in this repo:
+
+- No real OAuth or token refresh logic.
+- No production API client for QuickBooks Online.
+- No secrets management (environment variable strategy, Vault, and so on).
+- No infrastructure-as-code, containerization, or deployment scripts.
+- No orchestrator configuration (Airflow DAGs, Prefect flows, and so on).
+
+Those are left out on purpose so the focus stays on the data-engineering core: mapping, ID normalization, idempotent updates, and logging. In a real org, those concerns would be layered on top of this skeleton.
 
 ## Relevance for data engineering roles
 
-This project is aimed at showing how a data engineer approaches a concrete migration problem rather than how a candidate solves isolated coding puzzles.
+The project is meant to read like the minimal design and implementation for a real migration problem:
 
-Key aspects:
+- File- and row-level idempotency instead of “just rerun it and hope.”
+- Clear separation between discovery, verification, and writing to the external system.
+- Logs structured so that auditors and downstream analysts can work with them without reverse-engineering the code.
+- A fake API that forces the uploader to handle latency, missing files, and failures, instead of assuming happy paths.
 
-- Config-driven design that separates code from environment, using paths and options derived from environment variables.
-- Clear separation of concerns between discovery, mapping verification, authentication, API interaction, and logging.
-- Idempotent batch processing with a simple, explicit key and a durable run log.
-- Structured logging and CSV outputs that support observability, debugging, and audit.
-- A simulated external dependency that makes error handling and retries testable without relying on external services.
-
-The same patterns apply when moving from this synthetic setup to cloud storage, containerized workloads, and production schedulers.
+It is not a toy coding challenge; it is a self-contained example of how a migration pipeline might be shaped before being dropped into a larger platform.
